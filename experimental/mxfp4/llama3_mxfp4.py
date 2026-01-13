@@ -1,10 +1,14 @@
+import os
+os.environ["HF_HOME"] = "/home/beomseok.kwon/.cache"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.utils import dispatch_for_generation
 
-MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
+MODEL_ID = "Qwen/Qwen3-8B"
 
 # Load model.
 model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype="auto")
