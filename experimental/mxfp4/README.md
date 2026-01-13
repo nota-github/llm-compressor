@@ -69,7 +69,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 ```bash
 cd experimental/mxfp4
-uv run python gpt_oss_mxfp4.py
+python gpt_oss_mxfp4.py
 ```
 
 출력 디렉토리: `{model_name}-MXFP4/`
@@ -77,21 +77,16 @@ uv run python gpt_oss_mxfp4.py
 ### Step 2: OpenAI 포맷으로 변환
 
 ```bash
-uv run python convert_to_openai_format.py <input_dir> <output_dir>
+python convert_to_openai_format.py <input_dir> <output_dir>
 ```
 
 **예시:**
 
 ```bash
 # gpt-oss-20b 모델 변환
-uv run python convert_to_openai_format.py \
+python convert_to_openai_format.py \
     gpt-oss-20b-MXFP4 \
     gpt-oss-20b-MXFP4-openai
-
-# checkpoint 모델 변환
-uv run python convert_to_openai_format.py \
-    checkpoint-705-MXFP4 \
-    checkpoint-705-MXFP4-openai
 ```
 
 ## 전체 파이프라인 예시
@@ -100,10 +95,10 @@ uv run python convert_to_openai_format.py \
 cd experimental/mxfp4
 
 # 1. 양자화 (gpt_oss_mxfp4.py에서 MODEL_ID 수정 후)
-uv run python gpt_oss_mxfp4.py
+python gpt_oss_mxfp4.py
 
 # 2. OpenAI 포맷 변환
-uv run python convert_to_openai_format.py \
+python convert_to_openai_format.py \
     gpt-oss-20b-MXFP4 \
     gpt-oss-20b-MXFP4-openai
 
