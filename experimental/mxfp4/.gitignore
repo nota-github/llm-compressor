@@ -1,3 +1,4 @@
 # Ignore MXFP4 and openai folders
 *MXFP4*/
 *-openai/
+results
