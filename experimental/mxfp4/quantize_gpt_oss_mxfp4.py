@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
+from tqdm import tqdm
 from safetensors import safe_open
 from safetensors.torch import save_file
 
@@ -49,8 +50,22 @@ def resolve_model_dir(orig: str) -> str:
     raise ValueError(f"Input path '{orig}' is not a valid directory. Only local directories are supported.")
 
 def load_weight_map(model_dir: str) -> dict[str, str]:
-    with open(os.path.join(model_dir, "model.safetensors.index.json")) as f:
-        return json.load(f)["weight_map"]
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    single_path = os.path.join(model_dir, "model.safetensors")
+    
+    # Case 1: Sharded model with index file
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            return json.load(f)["weight_map"]
+    
+    # Case 2: Single safetensors file
+    if os.path.exists(single_path):
+        with safe_open(single_path, framework="pt") as f:
+            return {key: "model.safetensors" for key in f.keys()}
+    
+    raise FileNotFoundError(
+        f"Could not find 'model.safetensors.index.json' or 'model.safetensors' in {model_dir}"
+    )
 
 def invert_weight_map(weight_map: dict[str, str]) -> dict[str, list[str]]:
     files: dict[str, list[str]] = {}
@@ -58,23 +73,69 @@ def invert_weight_map(weight_map: dict[str, str]) -> dict[str, list[str]]:
         files.setdefault(fn, []).append(name)
     return {fn: sorted(names) for fn, names in sorted(files.items())}
 
-def compute_mxfp4_scale_u8(absmax: torch.Tensor, fp4_max: float = 6.0) -> torch.Tensor:
+def compute_mxfp4_scale_u8(absmax: torch.Tensor, fp4_max: float = 6.0,
+                           weight: torch.Tensor = None, optimize: bool = False):
+    # 기준 exp 계산 (heuristic)
     target = torch.maximum(absmax / fp4_max, torch.tensor(2.0**-126, device=absmax.device))
-    exp = torch.round(torch.log2(target)).to(torch.int32)
-    scale = torch.pow(2.0, exp.to(torch.float32))
+    base_exp = torch.round(torch.log2(target)).to(torch.int32)
+    scale = torch.pow(2.0, base_exp.to(torch.float32))
     # no-clipping fix
-    exp = exp + ((absmax / scale) > fp4_max).to(torch.int32)
-    return torch.clamp(exp + 127, min=1, max=254).to(torch.uint8)
+    base_exp = base_exp + ((absmax / scale) > fp4_max).to(torch.int32)
+    
+    if not optimize or weight is None:
+        # 기존 heuristic 방식
+        return torch.clamp(base_exp + 127, min=1, max=254).to(torch.uint8), None, None
+    
+    # Heuristic MSE 계산 (per-group)
+    heuristic_scale = torch.pow(2.0, base_exp.float())
+    heuristic_scaled = weight / heuristic_scale.unsqueeze(-1)
+    heuristic_quantized = FP4_E2M1_DATA.cast_to_fp4(heuristic_scaled.to(torch.bfloat16))
+    heuristic_dequantized = heuristic_quantized.float() * heuristic_scale.unsqueeze(-1)
+    heuristic_mse_per_group = ((weight - heuristic_dequantized) ** 2).mean(dim=-1)
+    heuristic_mse = heuristic_mse_per_group.mean()
+    
+    # Grid search: exp-5 ~ exp-1 (휴리스틱보다 작은 방향만)
+    # best_mse를 heuristic MSE로 초기화하여 더 좋은 경우에만 업데이트
+    best_exp = base_exp.clone()
+    best_mse = heuristic_mse_per_group.clone()
+    
+    for delta in range(-5, 0):  # -5, -4, -3, -2, -1
+        candidate_exp = base_exp + delta
+        scale = torch.pow(2.0, candidate_exp.float())
+        
+        # FP4 양자화 및 복원
+        scaled = weight / scale.unsqueeze(-1)
+        quantized = FP4_E2M1_DATA.cast_to_fp4(scaled.to(torch.bfloat16))
+        dequantized = quantized.float() * scale.unsqueeze(-1)
+        
+        # MSE 계산
+        mse = ((weight - dequantized) ** 2).mean(dim=-1)
+        
+        # 더 좋은 경우 업데이트
+        better = mse < best_mse
+        best_exp = torch.where(better, candidate_exp, best_exp)
+        best_mse = torch.where(better, mse, best_mse)
+    
+    # Optimized MSE 계산
+    optimized_mse = best_mse.mean()
+    
+    return torch.clamp(best_exp + 127, min=1, max=254).to(torch.uint8), heuristic_mse.item(), optimized_mse.item()
 
-def quantize_fp4_pack(weight: torch.Tensor, group_size: int = 32, fp4_max: float = 6.0) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_fp4_pack(weight: torch.Tensor, group_size: int = 32, fp4_max: float = 6.0,
+                      optimize: bool = False):
     out, in_f = weight.shape
     groups = in_f // group_size
-    absmax = weight.view(out, groups, group_size).abs().amax(dim=-1).to(torch.float32)
-    scale_u8 = compute_mxfp4_scale_u8(absmax, fp4_max)
+    weight_grouped = weight.view(out, groups, group_size)
+    absmax = weight_grouped.abs().amax(dim=-1).to(torch.float32)
+    scale_u8, heuristic_mse, optimized_mse = compute_mxfp4_scale_u8(
+        absmax, fp4_max,
+        weight=weight_grouped.to(torch.float32) if optimize else None,
+        optimize=optimize
+    )
     scale = scale_u8.view(torch.float8_e8m0fnu).to(torch.float32)
-    scaled = (weight.view(out, groups, group_size) / scale.view(out, groups, 1)).to(torch.bfloat16)
+    scaled = (weight_grouped / scale.view(out, groups, 1)).to(torch.bfloat16)
     q = FP4_E2M1_DATA.cast_to_fp4(scaled).reshape(out, in_f)
-    return pack_fp4_to_uint8(q).contiguous(), scale_u8.contiguous()
+    return pack_fp4_to_uint8(q).contiguous(), scale_u8.contiguous(), heuristic_mse, optimized_mse
 
 def reshape_to_gpt_oss_blocks(packed: torch.Tensor) -> torch.Tensor:
     out, p_in = packed.shape
@@ -124,7 +185,12 @@ class ShardWriter:
             "weight_map": {k: res[v] for k, v in self.weight_map.items()}
         }
 
-def convert(orig_dir: str, out_dir: str, group_size: int = 32, fp4_max: float = 6.0, shard_size_gb: int = 5, layers: Optional[list[int]] = None):
+def convert(orig_dir: str, out_dir: str, group_size: int = 32, fp4_max: float = 6.0, 
+            shard_size_gb: int = 5, layers: Optional[list[int]] = None, optimize_scale: bool = False):
+    # Auto-detect device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
     os.makedirs(out_dir, exist_ok=True)
     w_map = load_weight_map(orig_dir)
     
@@ -157,7 +223,8 @@ def convert(orig_dir: str, out_dir: str, group_size: int = 32, fp4_max: float = 
 
     # 2) Process and Quantize Expert tensors
     layer_ids = sorted({int(_FUSED_GATE_UP_KEY.match(k).group(1)) for k in w_map if _FUSED_GATE_UP_KEY.match(k)})
-    for li in (layer_ids if layers is None else layers):
+    target_layers = layer_ids if layers is None else layers
+    for li in tqdm(target_layers, desc="Processing layers"):
         p = f"model.layers.{li}.mlp.experts"
         with safe_open(os.path.join(orig_dir, w_map[f"{p}.gate_up_proj"]), framework="pt") as f_gu, \
              safe_open(os.path.join(orig_dir, w_map[f"{p}.down_proj"]), framework="pt") as f_d, \
@@ -172,19 +239,30 @@ def convert(orig_dir: str, out_dir: str, group_size: int = 32, fp4_max: float = 
             writer.add(f"{p}.gate_up_proj_bias", gub_sl[:].to(torch.bfloat16))
             writer.add(f"{p}.down_proj_bias", db_sl[:].to(torch.bfloat16))
 
+            layer_heuristic_mse, layer_optimized_mse = [], []
             for ei in range(num_e):
-                Wi, Wd = gu_sl[ei].to(torch.float32), d_sl[ei].to(torch.float32)
+                Wi, Wd = gu_sl[ei].to(device=device, dtype=torch.float32), d_sl[ei].to(device=device, dtype=torch.float32)
                 Wg, Wu = Wi[:, 0::2].t().contiguous(), Wi[:, 1::2].t().contiguous()
                 Wdown = Wd.t().contiguous()
 
-                g_p, g_s = quantize_fp4_pack(Wg, group_size, fp4_max)
-                u_p, u_s = quantize_fp4_pack(Wu, group_size, fp4_max)
-                d_p, d_s = quantize_fp4_pack(Wdown, group_size, fp4_max)
+                g_p, g_s, g_h_mse, g_o_mse = quantize_fp4_pack(Wg, group_size, fp4_max, optimize_scale)
+                u_p, u_s, u_h_mse, u_o_mse = quantize_fp4_pack(Wu, group_size, fp4_max, optimize_scale)
+                d_p, d_s, d_h_mse, d_o_mse = quantize_fp4_pack(Wdown, group_size, fp4_max, optimize_scale)
+
+                if optimize_scale:
+                    layer_heuristic_mse.extend([g_h_mse, u_h_mse, d_h_mse])
+                    layer_optimized_mse.extend([g_o_mse, u_o_mse, d_o_mse])
 
                 gu_b_l.append(interleave_gate_up(reshape_to_gpt_oss_blocks(g_p), reshape_to_gpt_oss_blocks(u_p)))
                 gu_s_l.append(interleave_gate_up(g_s, u_s))
                 d_b_l.append(reshape_to_gpt_oss_blocks(d_p))
                 d_s_l.append(d_s)
+
+            if optimize_scale and layer_heuristic_mse:
+                avg_h_mse = sum(layer_heuristic_mse) / len(layer_heuristic_mse)
+                avg_o_mse = sum(layer_optimized_mse) / len(layer_optimized_mse)
+                reduction = (1 - avg_o_mse / avg_h_mse) * 100 if avg_h_mse > 0 else 0
+                tqdm.write(f"  Layer {li}: MSE {avg_h_mse:.6e} -> {avg_o_mse:.6e} (reduction: {reduction:.2f}%)")
 
             writer.add(f"{p}.gate_up_proj_blocks", torch.stack(gu_b_l))
             writer.add(f"{p}.gate_up_proj_scales", torch.stack(gu_s_l))
@@ -203,12 +281,14 @@ def main():
     p.add_argument("--fp4-max", type=float, default=6.0)
     p.add_argument("--shard-size-gb", type=int, default=5)
     p.add_argument("--layers", default=None, help="Comma-separated layer indices to process")
+    p.add_argument("--optimize-scale", action="store_true",
+                   help="Enable grid search to find optimal scale (slower but more accurate)")
     
     args = p.parse_args()
     orig_dir = resolve_model_dir(args.orig)
     layers = [int(x) for x in args.layers.split(",") if x.strip()] if args.layers else None
     
-    convert(orig_dir, args.out, args.group_size, args.fp4_max, args.shard_size_gb, layers)
+    convert(orig_dir, args.out, args.group_size, args.fp4_max, args.shard_size_gb, layers, args.optimize_scale)
     print(f"[OK] Wrote GPT-OSS MXFP4 model to: {args.out}")
 
 if __name__ == "__main__":
