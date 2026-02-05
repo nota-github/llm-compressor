@@ -198,7 +198,7 @@ def convert(orig_dir: str, out_dir: str, group_size: int = 32, fp4_max: float = 
 
     # Copy metadata files
     for fn in os.listdir(orig_dir):
-        if not fn.endswith(".safetensors") and fn not in {"model.safetensors.index.json", "config.json"}:
+        if not fn.endswith(".safetensors") and fn not in {"model.safetensors.index.json", "config.json"} and not fn.startswith('global_step'):
             shutil.copy2(os.path.join(orig_dir, fn), os.path.join(out_dir, fn))
     
     # Update config.json
