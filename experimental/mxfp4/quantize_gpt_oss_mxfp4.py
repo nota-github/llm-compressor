@@ -121,8 +121,13 @@ def compute_mxfp4_scale_u8(absmax: torch.Tensor, fp4_max: float = 6.0,
     
     return torch.clamp(best_exp + 127, min=1, max=254).to(torch.uint8), heuristic_mse.item(), optimized_mse.item()
 
-def quantize_fp4_pack(weight: torch.Tensor, group_size: int = 32, fp4_max: float = 6.0,
-                      optimize: bool = False):
+def quantize_fp4_pack(
+    weight: torch.Tensor,
+    group_size: int = 32,
+    fp4_max: float = 6.0,
+    optimize: bool = False,
+    return_dequantized: bool = False,
+):
     out, in_f = weight.shape
     groups = in_f // group_size
     weight_grouped = weight.view(out, groups, group_size)
@@ -134,8 +139,12 @@ def quantize_fp4_pack(weight: torch.Tensor, group_size: int = 32, fp4_max: float
     )
     scale = scale_u8.view(torch.float8_e8m0fnu).to(torch.float32)
     scaled = (weight_grouped / scale.view(out, groups, 1)).to(torch.bfloat16)
-    q = FP4_E2M1_DATA.cast_to_fp4(scaled).reshape(out, in_f)
-    return pack_fp4_to_uint8(q).contiguous(), scale_u8.contiguous(), heuristic_mse, optimized_mse
+    q = FP4_E2M1_DATA.cast_to_fp4(scaled)
+    packed = pack_fp4_to_uint8(q.reshape(out, in_f)).contiguous()
+    dequantized = None
+    if return_dequantized:
+        dequantized = (q.float() * scale.view(out, groups, 1)).reshape(out, in_f).to(torch.bfloat16).contiguous()
+    return packed, scale_u8.contiguous(), heuristic_mse, optimized_mse, dequantized
 
 def reshape_to_gpt_oss_blocks(packed: torch.Tensor) -> torch.Tensor:
     out, p_in = packed.shape
@@ -185,13 +194,24 @@ class ShardWriter:
             "weight_map": {k: res[v] for k, v in self.weight_map.items()}
         }
 
-def convert(orig_dir: str, out_dir: str, group_size: int = 32, fp4_max: float = 6.0, 
-            shard_size_gb: int = 5, layers: Optional[list[int]] = None, optimize_scale: bool = False):
+def convert(
+    orig_dir: str,
+    out_dir: str,
+    group_size: int = 32,
+    fp4_max: float = 6.0,
+    shard_size_gb: int = 5,
+    layers: Optional[list[int]] = None,
+    optimize_scale: bool = False,
+    save_dequantized: bool = False,
+):
     # Auto-detect device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
     os.makedirs(out_dir, exist_ok=True)
+    deq_out_dir = f"{os.path.normpath(out_dir)}-dequant" if save_dequantized else None
+    if save_dequantized:
+        os.makedirs(deq_out_dir, exist_ok=True)
     w_map = load_weight_map(orig_dir)
     
     detect_checkpoint_layout(w_map)
@@ -200,18 +220,27 @@ def convert(orig_dir: str, out_dir: str, group_size: int = 32, fp4_max: float = 
     for fn in os.listdir(orig_dir):
         if not fn.endswith(".safetensors") and fn not in {"model.safetensors.index.json", "config.json"} and not fn.startswith('global_step'):
             shutil.copy2(os.path.join(orig_dir, fn), os.path.join(out_dir, fn))
+            if save_dequantized:
+                shutil.copy2(os.path.join(orig_dir, fn), os.path.join(deq_out_dir, fn))
     
     # Update config.json
     with open(os.path.join(orig_dir, "config.json")) as f:
-        cfg = json.load(f)
-    cfg["quantization_config"] = {
+        cfg_orig = json.load(f)
+    cfg_quant = json.loads(json.dumps(cfg_orig))
+    cfg_quant["quantization_config"] = {
         "modules_to_not_convert": ["model.layers.*.self_attn", "model.layers.*.mlp.router", "model.embed_tokens", "lm_head"],
         "quant_method": "mxfp4"
     }
     with open(os.path.join(out_dir, "config.json"), "w") as f:
-        json.dump(cfg, f, indent=2)
+        json.dump(cfg_quant, f, indent=2)
+    if save_dequantized:
+        with open(os.path.join(deq_out_dir, "config.json"), "w") as f:
+            json.dump(cfg_orig, f, indent=2)
 
     writer = ShardWriter(out_dir, shard_size_gb * 1024**3)
+    deq_writer = None
+    if save_dequantized:
+        deq_writer = ShardWriter(deq_out_dir, shard_size_gb * 1024**3)
     f_map = invert_weight_map(w_map)
     
     # 1) Copy non-expert tensors
@@ -219,7 +248,10 @@ def convert(orig_dir: str, out_dir: str, group_size: int = 32, fp4_max: float = 
         with safe_open(os.path.join(orig_dir, fn), framework="pt") as f:
             for n in names:
                 if not any(r.match(n) for r in [_FUSED_GATE_UP_KEY, _FUSED_DOWN_KEY, _FUSED_GATE_UP_BIAS_KEY, _FUSED_DOWN_BIAS_KEY]):
-                    writer.add(n, f.get_tensor(n))
+                    tensor = f.get_tensor(n)
+                    writer.add(n, tensor)
+                    if save_dequantized:
+                        deq_writer.add(n, tensor)
 
     # 2) Process and Quantize Expert tensors
     layer_ids = sorted({int(_FUSED_GATE_UP_KEY.match(k).group(1)) for k in w_map if _FUSED_GATE_UP_KEY.match(k)})
@@ -236,8 +268,12 @@ def convert(orig_dir: str, out_dir: str, group_size: int = 32, fp4_max: float = 
             
             num_e = gu_sl.get_shape()[0]
             gu_b_l, gu_s_l, d_b_l, d_s_l = [], [], [], []
+            gu_deq_l, d_deq_l = ([], []) if save_dequantized else (None, None)
             writer.add(f"{p}.gate_up_proj_bias", gub_sl[:].to(torch.bfloat16))
             writer.add(f"{p}.down_proj_bias", db_sl[:].to(torch.bfloat16))
+            if save_dequantized:
+                deq_writer.add(f"{p}.gate_up_proj_bias", gub_sl[:].to(torch.bfloat16))
+                deq_writer.add(f"{p}.down_proj_bias", db_sl[:].to(torch.bfloat16))
 
             layer_heuristic_mse, layer_optimized_mse = [], []
             for ei in range(num_e):
@@ -245,9 +281,15 @@ def convert(orig_dir: str, out_dir: str, group_size: int = 32, fp4_max: float = 
                 Wg, Wu = Wi[:, 0::2].t().contiguous(), Wi[:, 1::2].t().contiguous()
                 Wdown = Wd.t().contiguous()
 
-                g_p, g_s, g_h_mse, g_o_mse = quantize_fp4_pack(Wg, group_size, fp4_max, optimize_scale)
-                u_p, u_s, u_h_mse, u_o_mse = quantize_fp4_pack(Wu, group_size, fp4_max, optimize_scale)
-                d_p, d_s, d_h_mse, d_o_mse = quantize_fp4_pack(Wdown, group_size, fp4_max, optimize_scale)
+                g_p, g_s, g_h_mse, g_o_mse, g_dq = quantize_fp4_pack(
+                    Wg, group_size, fp4_max, optimize_scale, return_dequantized=save_dequantized
+                )
+                u_p, u_s, u_h_mse, u_o_mse, u_dq = quantize_fp4_pack(
+                    Wu, group_size, fp4_max, optimize_scale, return_dequantized=save_dequantized
+                )
+                d_p, d_s, d_h_mse, d_o_mse, d_dq = quantize_fp4_pack(
+                    Wdown, group_size, fp4_max, optimize_scale, return_dequantized=save_dequantized
+                )
 
                 if optimize_scale:
                     layer_heuristic_mse.extend([g_h_mse, u_h_mse, d_h_mse])
@@ -257,6 +299,9 @@ def convert(orig_dir: str, out_dir: str, group_size: int = 32, fp4_max: float = 
                 gu_s_l.append(interleave_gate_up(g_s, u_s))
                 d_b_l.append(reshape_to_gpt_oss_blocks(d_p))
                 d_s_l.append(d_s)
+                if save_dequantized:
+                    gu_deq_l.append(interleave_gate_up(g_dq, u_dq))
+                    d_deq_l.append(d_dq)
 
             if optimize_scale and layer_heuristic_mse:
                 avg_h_mse = sum(layer_heuristic_mse) / len(layer_heuristic_mse)
@@ -268,9 +313,18 @@ def convert(orig_dir: str, out_dir: str, group_size: int = 32, fp4_max: float = 
             writer.add(f"{p}.gate_up_proj_scales", torch.stack(gu_s_l))
             writer.add(f"{p}.down_proj_blocks", torch.stack(d_b_l))
             writer.add(f"{p}.down_proj_scales", torch.stack(d_s_l))
+            if save_dequantized:
+                # Restore original fused tensor layout for convenience:
+                # gate_up_proj: [num_experts, in_features, out_features*2]
+                # down_proj:    [num_experts, in_features, out_features]
+                deq_writer.add(f"{p}.gate_up_proj", torch.stack(gu_deq_l).transpose(-1, -2).contiguous())
+                deq_writer.add(f"{p}.down_proj", torch.stack(d_deq_l).transpose(-1, -2).contiguous())
 
     with open(os.path.join(out_dir, "model.safetensors.index.json"), "w") as f:
         json.dump(writer.finalize(), f, indent=2)
+    if save_dequantized:
+        with open(os.path.join(deq_out_dir, "model.safetensors.index.json"), "w") as f:
+            json.dump(deq_writer.finalize(), f, indent=2)
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
@@ -283,13 +337,29 @@ def main():
     p.add_argument("--layers", default=None, help="Comma-separated layer indices to process")
     p.add_argument("--optimize-scale", action="store_true",
                    help="Enable grid search to find optimal scale (slower but more accurate)")
+    p.add_argument(
+        "--save-dequantized",
+        action="store_true",
+        help="Also save dequantized BF16 checkpoint under <out>-dequant/",
+    )
     
     args = p.parse_args()
     orig_dir = resolve_model_dir(args.orig)
     layers = [int(x) for x in args.layers.split(",") if x.strip()] if args.layers else None
     
-    convert(orig_dir, args.out, args.group_size, args.fp4_max, args.shard_size_gb, layers, args.optimize_scale)
+    convert(
+        orig_dir,
+        args.out,
+        args.group_size,
+        args.fp4_max,
+        args.shard_size_gb,
+        layers,
+        args.optimize_scale,
+        args.save_dequantized,
+    )
     print(f"[OK] Wrote GPT-OSS MXFP4 model to: {args.out}")
+    if args.save_dequantized:
+        print(f"[OK] Wrote dequantized BF16 model to: {os.path.normpath(args.out)}-dequant")
 
 if __name__ == "__main__":
     main()
